@@ -20,8 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install HTML parser
-        run: pip install "beautifulsoup4>=4.12,<5"
+      - name: Install HTTP client
+        run: pip install "requests>=2.31,<3"
       - name: Collect verified post-clearing fund shares
         run: python scripts/collect_sse_shares.py
       - name: Upload diagnostic (even on failure)
