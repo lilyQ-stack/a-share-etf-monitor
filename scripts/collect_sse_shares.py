@@ -44,9 +44,9 @@ def parse_share_rows(html, code):
     # Keep only explicitly dated rows with the exact fund code and '万份' scale.
     if "总份额（万份）" not in section and "总份额(万份)" not in section:
         return [], "missing_total_shares_header"
-    pattern = re.compile(r"(20\\d{2}-\\d{2}-\\d{2})\\s+" + re.escape(code) +
-                         r"\\s+(.{1,55}?)\\s+([\\d,]+(?:\\.\\d+)?)"
-                         r"(?=\\s+(?:20\\d{2}-\\d{2}-\\d{2}|注：|注:|$))")
+    pattern = re.compile(r"(20\d{2}-\d{2}-\d{2})\s+" + re.escape(code) +
+                         r"\s+(.{1,55}?)\s+([\d,]+(?:\.\d+)?)"
+                         r"(?=\s+(?:20\d{2}-\d{2}-\d{2}|注：|注:|$))")
     result = []
     for match in pattern.finditer(section):
         date, label, share_text = match.groups()
@@ -118,7 +118,7 @@ def main():
         diag["new_rows"]=persist(candidates)
     diag["status"]="observed" if candidates else "no_verified_rows"
     DIAGNOSTIC.parent.mkdir(parents=True,exist_ok=True)
-    DIAGNOSTIC.write_text(json.dumps(diag,ensure_ascii=False,indent=2)+"\\n",encoding="utf-8")
+    DIAGNOSTIC.write_text(json.dumps(diag,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     print(json.dumps(diag,ensure_ascii=False,indent=2))
     if not candidates: raise SystemExit("No verified SSE share rows; refusing to fabricate")
 
