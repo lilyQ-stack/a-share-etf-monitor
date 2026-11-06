@@ -1,0 +1,47 @@
+name: SSE ETF clearing shares (validation stage)
+on:
+  workflow_dispatch:
+  schedule:
+    # 20:15 Beijing Monday-Friday, and 07:10 Beijing Tuesday-Saturday.
+    # UTC day of week differs for the morning run.
+    - cron: '15 12 * * 1-5'
+    - cron: '10 23 * * 1-5'
+permissions:
+  contents: write
+concurrency:
+  group: sse-shares-history
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install HTML parser
+        run: pip install "beautifulsoup4>=4.12,<5"
+      - name: Collect verified post-clearing fund shares
+        run: python scripts/collect_sse_shares.py
+      - name: Upload diagnostic (even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sse-shares-diagnostic
+          path: output/sse_diagnostic.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Commit accepted records only
+        if: success()
+        run: |
+          if [[ -z "$(git status --porcelain -- data/sse_shares.csv)" ]]; then
+            echo "No new verified share rows"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/sse_shares.csv
+          git commit -m "Append verified SSE clearing share records"
+          git pull --rebase origin main
+          git push origin HEAD:main
