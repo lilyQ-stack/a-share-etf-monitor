@@ -1,125 +1,125 @@
 #!/usr/bin/env python3
-"""Conservative SSE post-clearing ETF share collector. No synthetic data."""
-import argparse
+"""Collect SSE post-clearing ETF shares via the exchange's dated ETF-scale JSON.
+Fail closed: never fill missing funds, invent dates or infer net flows.
+"""
 import csv
 import json
 import os
-import re
-import urllib.request
-from datetime import datetime
-from io import StringIO
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import requests
 
 FUNDS = {"510300":"沪深300", "510310":"沪深300", "510330":"沪深300",
          "510050":"上证50", "510180":"上证180", "510500":"中证500",
          "512100":"中证1000", "588080":"科创50"}
-SOURCE = "https://www.sse.com.cn/assortment/fund/list/etfinfo/basic/index.shtml?FUNDID={code}"
+URL = "https://query.sse.com.cn/commonQuery.do"
+REFERER = "https://www.sse.com.cn/market/funddata/volumn/etfvolumn/"
+SQL_ID = "COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L"
 DATA = Path("data/sse_shares.csv")
-DIAGNOSTIC = Path("output/sse_diagnostic.json")
+DIAG = Path("output/sse_diagnostic.json")
 FIELDS = ["date","code","index","shares_10k","shares","source","captured_at_cst"]
+TZ = ZoneInfo("Asia/Shanghai")
 
-def download(code):
-    url = SOURCE.format(code=code)
-    request = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; ETF research collector)",
-        "Accept": "text/html,application/xhtml+xml",
-        "Referer": "https://www.sse.com.cn/"})
-    with urllib.request.urlopen(request, timeout=25) as response:
-        raw = response.read(5_000_000)
-    return raw.decode("utf-8", errors="replace"), url
-
-def parse_share_rows(html, code):
-    """Only accept fully labelled, fund-specific rows in the 基金规模 section.
-    Do not parse PCF creation units, trading volume, or fund AUM."""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    # Fail closed when server responds with a JavaScript-only application shell.
-    start = text.find("基金规模")
-    if start < 0:
-        return [], "missing_fund_scale_section"
-    stop = text.find("公告申购赎回清单", start + 4)
-    section = text[start: stop if stop > start else None]
-    # Keep only explicitly dated rows with the exact fund code and '万份' scale.
-    if "总份额（万份）" not in section and "总份额(万份)" not in section:
-        return [], "missing_total_shares_header"
-    pattern = re.compile(r"(20\d{2}-\d{2}-\d{2})\s+" + re.escape(code) +
-                         r"\s+(.{1,55}?)\s+([\d,]+(?:\.\d+)?)"
-                         r"(?=\s+(?:20\d{2}-\d{2}-\d{2}|注：|注:|$))")
-    result = []
-    for match in pattern.finditer(section):
-        date, label, share_text = match.groups()
+def fetch_date(session, date):
+    params = {
+        "isPagination":"true", "pageHelp.pageSize":"1000",
+        "pageHelp.pageNo":"1", "pageHelp.beginPage":"1",
+        "pageHelp.cacheSize":"1", "pageHelp.endPage":"1",
+        "sqlId":SQL_ID, "STAT_DATE":date
+    }
+    response=session.get(URL,params=params,timeout=25)
+    response.raise_for_status()
+    obj=response.json()
+    if not isinstance(obj,dict): raise ValueError("Unexpected JSON root")
+    rows=obj.get("result")
+    if not isinstance(rows,list): rows=(obj.get("pageHelp") or {}).get("data")
+    if not isinstance(rows,list): raise ValueError("Missing result/pageHelp.data")
+    count=int((obj.get("pageHelp") or {}).get("pageCount") or 1)
+    if count>1: raise ValueError(f"Pagination count {count}>1; refusing incomplete set")
+    selected={}
+    for row in rows:
+        if not isinstance(row,dict): continue
+        code=str(row.get("SEC_CODE") or "").strip()
+        if code not in FUNDS: continue
+        rowdate=str(row.get("STAT_DATE") or "").strip()
+        if rowdate!=date: raise ValueError(f"Date mismatch for {code}: {rowdate!r}")
+        if code in selected: raise ValueError(f"Duplicate {code} on {date}")
         try:
-            datetime.strptime(date, "%Y-%m-%d")
-            amount = float(share_text.replace(",", ""))
-            if not (0 < amount < 1e10):
-                continue
-            # The official field is 万份 (10,000 shares), not 份 or 亿元.
-            result.append({"date":date,"code":code,"index":FUNDS[code],
-                           "shares_10k":format(amount, ".4f").rstrip("0").rstrip("."),
-                           "shares":str(round(amount * 10000)),
-                           "source":SOURCE.format(code=code)})
-        except (ValueError, OverflowError):
-            continue
-    return result, ("ok" if result else "no_valid_dated_rows")
+            vol=Decimal(str(row["TOT_VOL"]).replace(",","").strip())
+            shares=vol*10000
+            if not vol.is_finite() or vol<=0 or shares!=shares.to_integral_value():
+                raise ValueError("Invalid fractional/zero share count")
+        except (KeyError,InvalidOperation,TypeError) as exc:
+            raise ValueError(f"Invalid TOT_VOL for {code}") from exc
+        selected[code]={"date":date,"code":code,"index":FUNDS[code],
+            "shares_10k":format(vol,"f"),
+            "shares":str(int(shares)),
+            "source":REFERER}
+    if set(selected)!=set(FUNDS):
+        missing=sorted(set(FUNDS)-set(selected))
+        raise ValueError(f"Incomplete ETF set ({len(selected)}/8), missing={missing}, raw_rows={len(rows)}")
+    return [selected[k] for k in sorted(selected)],len(rows)
 
-def persist(rows):
-    DATA.parent.mkdir(parents=True, exist_ok=True)
-    old = []
+def persist(incoming):
+    DATA.parent.mkdir(parents=True,exist_ok=True)
+    existing=[]
     if DATA.exists():
-        with DATA.open(encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames != FIELDS:
-                raise ValueError("CSV schema mismatch; refusing overwrite")
-            old = list(reader)
-    merged = {(r["date"],r["code"]):r for r in old}
-    for r in rows:
-        key = (r["date"],r["code"])
-        if key in merged and merged[key]["shares"] != r["shares"]:
-            raise ValueError(f"Official share revision requires manual review: {key}")
-        merged.setdefault(key, r)
-    records = sorted(merged.values(), key=lambda r:(r["date"],r["code"]))
-    if len(records) == len(old):
-        return 0
-    import tempfile
-    with tempfile.NamedTemporaryFile("w",dir=DATA.parent,delete=False,encoding="utf-8",newline="") as f:
-        writer=csv.DictWriter(f,fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(records)
-        temp=f.name
-    os.replace(temp,DATA)
-    return len(records)-len(old)
+        with DATA.open(newline="",encoding="utf-8") as f:
+            reader=csv.DictReader(f)
+            if reader.fieldnames!=FIELDS: raise ValueError("Unexpected historical CSV schema")
+            existing=list(reader)
+    indexed={(r["date"],r["code"]):r for r in existing}
+    if len(indexed)!=len(existing): raise ValueError("Duplicate stored dates/codes")
+    for row in incoming:
+        key=(row["date"],row["code"])
+        if key in indexed and indexed[key]["shares"]!=row["shares"]:
+            raise ValueError(f"Official revision for {key}; review manually")
+        indexed.setdefault(key,row)
+    added=len(indexed)-len(existing)
+    if added:
+        tmp=DATA.with_suffix(".tmp")
+        with tmp.open("w",newline="",encoding="utf-8") as f:
+            writer=csv.DictWriter(f,fieldnames=FIELDS)
+            writer.writeheader()
+            writer.writerows(sorted(indexed.values(),key=lambda r:(r["date"],r["code"])))
+        os.replace(tmp,DATA)
+    return added
 
 def main():
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--probe",action="store_true",help="Only diagnose; do not write history")
-    args=parser.parse_args()
-    now=datetime.now(ZoneInfo("Asia/Shanghai"))
-    diag={"captured_at_cst":now.isoformat(),"mode":"probe" if args.probe else "collect",
-          "instruments":{},"new_rows":0,
-          "note":"Share data only. No NAV, net subscription or national-team attribution."}
-    candidates=[]
-    for code in FUNDS:
-        try:
-            html,url=download(code)
-            rows,status=parse_share_rows(html,code)
-            # Do not allow future-dated rows or implausibly old future-year dates.
-            rows=[r for r in rows if r["date"] <= now.date().isoformat()]
-            candidates.extend(rows)
-            diag["instruments"][code]={"status":status,"rows":len(rows),
-                                      "latest":max((r["date"] for r in rows),default=None),
-                                      "response_bytes":len(html),"source":url}
-        except Exception as exc:
-            diag["instruments"][code]={"status":"error","error":f"{type(exc).__name__}: {exc}"}
-    if not args.probe and candidates:
-        stamp=now.isoformat()
-        for row in candidates: row["captured_at_cst"]=stamp
-        diag["new_rows"]=persist(candidates)
-    diag["status"]="observed" if candidates else "no_verified_rows"
-    DIAGNOSTIC.parent.mkdir(parents=True,exist_ok=True)
-    DIAGNOSTIC.write_text(json.dumps(diag,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
-    print(json.dumps(diag,ensure_ascii=False,indent=2))
-    if not candidates: raise SystemExit("No verified SSE share rows; refusing to fabricate")
-
-if __name__=="__main__": main()
+    now=datetime.now(TZ)
+    diag={"captured_at_cst":now.isoformat(),"source":URL,
+          "source_page":REFERER,"status":"not_verified",
+          "dates":{},"new_rows":0}
+    DIAG.parent.mkdir(parents=True,exist_ok=True)
+    try:
+        session=requests.Session()
+        session.headers.update({"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36",
+          "Referer":REFERER,"Accept":"application/json, text/javascript, */*; q=0.01"})
+        accepted=[]
+        # Query a short window so a delayed daily run can recover recent trading days.
+        # Weekends/holidays have no rows and are not treated as errors for other dates.
+        for age in range(0,9):
+            date=(now.date()-timedelta(days=age)).isoformat()
+            if (now.date()-timedelta(days=age)).weekday()>=5: continue
+            try:
+                rows,total=fetch_date(session,date)
+                for row in rows: row["captured_at_cst"]=now.isoformat()
+                accepted.extend(rows)
+                diag["dates"][date]={"status":"verified","funds":len(rows),"source_rows":total}
+            except Exception as exc:
+                diag["dates"][date]={"status":"rejected","error":f"{type(exc).__name__}: {exc}"}
+        if accepted:
+            diag["new_rows"]=persist(accepted)
+            diag["status"]="verified_partial_dates" if any(x["status"]=="rejected" for x in diag["dates"].values()) else "verified"
+        else: diag["status"]="no_verified_dates"
+    except Exception as exc:
+        diag["fatal_error"]=f"{type(exc).__name__}: {exc}"
+    finally:
+        DIAG.write_text(json.dumps(diag,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        print(json.dumps(diag,ensure_ascii=False,indent=2))
+    if diag["status"] not in ("verified","verified_partial_dates"):
+        raise SystemExit("No verified complete date; see diagnostic")
+if __name__=="__main__":main()
